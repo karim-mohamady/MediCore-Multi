@@ -1,0 +1,6 @@
+{
+  "name": "MediCore Multi-Tenant Healthcare Platform",
+  "description": "Enterprise-grade multi-tenant clinic management, EHR, live queue, appointment scheduling, and patient portal SaaS platform.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

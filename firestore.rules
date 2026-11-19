@@ -1,0 +1,653 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global default deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Core Identity, Status & Canonical Role Helpers
+    // -------------------------------------------------------------------------
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    function userDocPath() {
+      return /databases/$(database)/documents/users/$(request.auth.uid);
+    }
+
+    function hasUserDoc() {
+      return isSignedIn() && exists(userDocPath());
+    }
+
+    function getUserDoc() {
+      return get(userDocPath()).data;
+    }
+
+    function isActiveAccount() {
+      return hasUserDoc() && getUserDoc().get('status', 'active') == 'active';
+    }
+
+    // Canonical 8 roles
+    function isValidRole(role) {
+      return role in [
+        'super_admin',
+        'clinic_owner',
+        'clinic_manager',
+        'doctor',
+        'receptionist',
+        'nurse',
+        'accountant',
+        'patient'
+      ];
+    }
+
+    function isClinicActive(clinicId) {
+      return isValidId(clinicId) &&
+             exists(/databases/$(database)/documents/clinics/$(clinicId)) &&
+             get(/databases/$(database)/documents/clinics/$(clinicId)).data.get('status', '') == 'active';
+    }
+
+    function isSuperAdmin() {
+      return isActiveAccount() &&
+             getUserDoc().get('role', '') == 'super_admin';
+    }
+
+    function isStaffMemberWithRole(clinicId, allowedRoles) {
+      return isActiveAccount() &&
+             isValidId(clinicId) &&
+             getUserDoc().get('clinicId', '') == clinicId &&
+             getUserDoc().get('role', '') in allowedRoles &&
+             isClinicActive(clinicId);
+    }
+
+    function isClinicOwner(clinicId) {
+      return isStaffMemberWithRole(clinicId, ['clinic_owner']) &&
+             get(/databases/$(database)/documents/clinics/$(clinicId)).data.get('ownerUid', '') == request.auth.uid;
+    }
+
+    function isClinicManagerOrOwner(clinicId) {
+      return isStaffMemberWithRole(clinicId, ['clinic_manager']) || isClinicOwner(clinicId);
+    }
+
+    function isDoctor(clinicId) {
+      return isStaffMemberWithRole(clinicId, ['doctor']);
+    }
+
+    function isReceptionistOrStaff(clinicId) {
+      return isStaffMemberWithRole(clinicId, ['receptionist', 'nurse', 'clinic_manager']) || isClinicOwner(clinicId);
+    }
+
+    function isAccountantOrAdmin(clinicId) {
+      return isStaffMemberWithRole(clinicId, ['accountant', 'clinic_manager']) || isClinicOwner(clinicId);
+    }
+
+    function isAnyTenantStaff(clinicId) {
+      return isStaffMemberWithRole(clinicId, ['clinic_manager', 'doctor', 'receptionist', 'nurse', 'accountant']) || isClinicOwner(clinicId);
+    }
+
+    // Clinical PHI staff: strictly doctors, nurses, and clinic owner (clinic_manager excluded from unrestricted PHI)
+    function isClinicalStaff(clinicId) {
+      return isStaffMemberWithRole(clinicId, ['doctor', 'nurse']) || isClinicOwner(clinicId);
+    }
+
+    function patientExistsInClinic(clinicId, patientId) {
+      return isValidId(patientId) &&
+             exists(/databases/$(database)/documents/clinics/$(clinicId)/patients/$(patientId));
+    }
+
+    function isPatientOwner(clinicId, patientId) {
+      return isActiveAccount() &&
+             isValidId(clinicId) &&
+             isValidId(patientId) &&
+             getUserDoc().get('clinicId', '') == clinicId &&
+             getUserDoc().get('role', '') == 'patient' &&
+             isClinicActive(clinicId) &&
+             patientExistsInClinic(clinicId, patientId) &&
+             (
+               request.auth.uid == patientId ||
+               get(/databases/$(database)/documents/clinics/$(clinicId)/patients/$(patientId)).data.get('userId', '') == request.auth.uid
+             );
+    }
+
+    // -------------------------------------------------------------------------
+    // Tenant & Field Immutability Guards
+    // -------------------------------------------------------------------------
+
+    function validTenantOnCreate(clinicId) {
+      return ('clinicId' in request.resource.data) &&
+             request.resource.data.clinicId != null &&
+             request.resource.data.clinicId == clinicId;
+    }
+
+    function validTenantOnUpdate(clinicId) {
+      return ('clinicId' in request.resource.data) &&
+             ('clinicId' in resource.data) &&
+             request.resource.data.clinicId != null &&
+             resource.data.clinicId != null &&
+             request.resource.data.clinicId == clinicId &&
+             request.resource.data.clinicId == resource.data.clinicId;
+    }
+
+    function validPatientOnUpdate() {
+      return ('patientId' in request.resource.data) &&
+             ('patientId' in resource.data) &&
+             request.resource.data.patientId != null &&
+             resource.data.patientId != null &&
+             request.resource.data.patientId == resource.data.patientId;
+    }
+
+    function validDoctorOnUpdate() {
+      return ('doctorId' in request.resource.data) &&
+             ('doctorId' in resource.data) &&
+             request.resource.data.doctorId != null &&
+             resource.data.doctorId != null &&
+             request.resource.data.doctorId == resource.data.doctorId;
+    }
+
+    // Appointment state machine transitions
+    function isValidAppointmentTransition(prevStatus, nextStatus) {
+      return prevStatus == nextStatus ||
+             (prevStatus == 'scheduled' && nextStatus in ['confirmed', 'arrived', 'cancelled', 'rescheduled']) ||
+             (prevStatus == 'confirmed' && nextStatus in ['arrived', 'cancelled', 'rescheduled']) ||
+             (prevStatus == 'arrived' && nextStatus in ['in_consultation', 'cancelled']) ||
+             (prevStatus == 'in_consultation' && nextStatus in ['completed', 'cancelled']);
+    }
+
+    // Queue state machine transitions
+    function isValidQueueTransition(prevStatus, nextStatus) {
+      return (prevStatus == 'waiting' && nextStatus in ['called', 'cancelled', 'skipped', 'no_show']) ||
+             (prevStatus == 'called' && nextStatus in ['in_room', 'in_consultation', 'waiting', 'cancelled', 'skipped', 'no_show']) ||
+             (prevStatus in ['in_room', 'in_consultation'] && nextStatus == 'completed');
+    }
+
+    // -------------------------------------------------------------------------
+    // Tenant Workspaces: /clinics/{clinicId}
+    // -------------------------------------------------------------------------
+
+    match /clinics/{clinicId} {
+      allow read: if isSuperAdmin() || (
+        isActiveAccount() &&
+        isValidRole(getUserDoc().get('role', '')) &&
+        getUserDoc().get('clinicId', '') == clinicId &&
+        isClinicActive(clinicId)
+      );
+
+      allow create: if isSignedIn() &&
+                    isValidId(clinicId) &&
+                    !exists(/databases/$(database)/documents/clinics/$(clinicId)) &&
+                    ('id' in request.resource.data && request.resource.data.id == clinicId) &&
+                    ('ownerUid' in request.resource.data && request.resource.data.ownerUid == request.auth.uid) &&
+                    ('status' in request.resource.data && request.resource.data.status == 'active');
+
+      allow update: if isSuperAdmin() || (
+        isClinicOwner(clinicId) &&
+        ('id' in request.resource.data && request.resource.data.id == resource.data.id) &&
+        ('ownerUid' in request.resource.data && request.resource.data.ownerUid == resource.data.ownerUid) &&
+        ('status' in request.resource.data && request.resource.data.status == resource.data.status)
+      );
+
+      allow delete: if false;
+
+      // Staff Membership
+      match /members/{userId} {
+        allow read: if isAnyTenantStaff(clinicId);
+
+        allow create: if isValidId(userId) && (
+          (
+            isClinicOwner(clinicId) &&
+            validTenantOnCreate(clinicId) &&
+            request.resource.data.get('userId', '') == userId &&
+            request.resource.data.get('role', '') in ['clinic_manager', 'doctor', 'receptionist', 'nurse', 'accountant']
+          ) ||
+          (
+            isSignedIn() &&
+            request.auth.uid == userId &&
+            request.resource.data.get('role', '') == 'clinic_owner' &&
+            validTenantOnCreate(clinicId) &&
+            request.resource.data.get('userId', '') == userId &&
+            !exists(/databases/$(database)/documents/clinics/$(clinicId)) &&
+            getAfter(/databases/$(database)/documents/clinics/$(clinicId)).data.ownerUid == request.auth.uid
+          )
+        );
+
+        allow update: if isClinicOwner(clinicId) &&
+                      validTenantOnUpdate(clinicId) &&
+                      request.resource.data.get('userId', '') == resource.data.userId &&
+                      request.resource.data.get('role', '') in ['clinic_manager', 'doctor', 'receptionist', 'nurse', 'accountant'] &&
+                      resource.data.get('role', '') != 'clinic_owner' &&
+                      request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                        'role', 'active', 'name', 'phone', 'specialty', 'updatedAt'
+                      ]);
+
+        allow delete: if isClinicOwner(clinicId) &&
+                      userId != request.auth.uid &&
+                      resource.data.get('role', '') != 'clinic_owner';
+      }
+
+      // Branches
+      match /branches/{branchId} {
+        allow read: if isAnyTenantStaff(clinicId);
+        allow create, update, delete: if isClinicOwner(clinicId);
+      }
+
+      // Patients (Demographics & Staff-Controlled Enrollment)
+      match /patients/{patientId} {
+        allow read: if isAnyTenantStaff(clinicId) || isPatientOwner(clinicId, patientId);
+
+        allow create: if isValidId(patientId) &&
+                      isReceptionistOrStaff(clinicId) &&
+                      validTenantOnCreate(clinicId) &&
+                      request.resource.data.get('id', '') == patientId;
+
+        allow update: if isReceptionistOrStaff(clinicId) &&
+                      validTenantOnUpdate(clinicId) &&
+                      (
+                        !('userId' in resource.data) ||
+                        resource.data.userId == null ||
+                        !('userId' in request.resource.data) ||
+                        request.resource.data.userId == resource.data.userId
+                      );
+
+        allow delete: if false;
+      }
+
+      // Patient Clinical Records (Vitals, Allergies, Chronic Conditions - Strict PHI Separation)
+      match /patientClinicalRecords/{patientId} {
+        allow read: if isClinicalStaff(clinicId) || isPatientOwner(clinicId, patientId);
+
+        allow create: if isClinicalStaff(clinicId) &&
+                      validTenantOnCreate(clinicId) &&
+                      ('patientId' in request.resource.data && request.resource.data.patientId == patientId) &&
+                      patientExistsInClinic(clinicId, patientId);
+
+        allow update: if isClinicalStaff(clinicId) &&
+                      validTenantOnUpdate(clinicId) &&
+                      validPatientOnUpdate() &&
+                      request.resource.data.patientId == patientId;
+
+        allow delete: if false;
+      }
+
+      // Deterministic Appointment Slot Locks
+      match /appointmentSlots/{slotId} {
+        allow read: if isAnyTenantStaff(clinicId) ||
+                    isPatientOwner(clinicId, resource.data.get('patientId', ''));
+
+        allow create: if isValidId(slotId) &&
+                      (
+                        isReceptionistOrStaff(clinicId) ||
+                        isDoctor(clinicId) ||
+                        (isPatientOwner(clinicId, request.resource.data.get('patientId', '')) && isClinicActive(clinicId))
+                      ) &&
+                      validTenantOnCreate(clinicId) &&
+                      request.resource.data.get('id', '') == slotId &&
+                      request.resource.data.get('status', '') == 'reserved' &&
+                      patientExistsInClinic(clinicId, request.resource.data.get('patientId', '')) &&
+                      !exists(/databases/$(database)/documents/clinics/$(clinicId)/appointmentSlots/$(slotId));
+
+        allow update: if validTenantOnUpdate(clinicId) &&
+                      validDoctorOnUpdate() &&
+                      (!('date' in request.resource.data) || request.resource.data.date == resource.data.date) &&
+                      (!('timeSlot' in request.resource.data) || request.resource.data.timeSlot == resource.data.timeSlot) &&
+                      (
+                        // Action 1: Cancel an active slot reservation
+                        (
+                          resource.data.get('status', '') == 'reserved' &&
+                          request.resource.data.get('status', '') == 'cancelled' &&
+                          validPatientOnUpdate() &&
+                          (isReceptionistOrStaff(clinicId) || isDoctor(clinicId) || isPatientOwner(clinicId, resource.data.get('patientId', '')))
+                        ) ||
+                        // Action 2: Rebook a previously cancelled deterministic slot
+                        (
+                          resource.data.get('status', '') == 'cancelled' &&
+                          request.resource.data.get('status', '') == 'reserved' &&
+                          patientExistsInClinic(clinicId, request.resource.data.get('patientId', '')) &&
+                          (isReceptionistOrStaff(clinicId) || isDoctor(clinicId) || isPatientOwner(clinicId, request.resource.data.get('patientId', '')))
+                        )
+                      );
+
+        allow delete: if false;
+      }
+
+      // Appointments
+      match /appointments/{appointmentId} {
+        allow read: if isAnyTenantStaff(clinicId) ||
+                    isPatientOwner(clinicId, resource.data.get('patientId', ''));
+
+        allow create: if isValidId(appointmentId) &&
+                      (
+                        isReceptionistOrStaff(clinicId) ||
+                        isDoctor(clinicId) ||
+                        (isPatientOwner(clinicId, request.resource.data.get('patientId', '')) && isClinicActive(clinicId))
+                      ) &&
+                      validTenantOnCreate(clinicId) &&
+                      ('patientId' in request.resource.data && patientExistsInClinic(clinicId, request.resource.data.patientId)) &&
+                      ('doctorId' in request.resource.data && request.resource.data.doctorId != null) &&
+                      request.resource.data.get('status', 'scheduled') in ['scheduled', 'confirmed'];
+
+        allow update: if validTenantOnUpdate(clinicId) &&
+                      validPatientOnUpdate() &&
+                      isActiveAccount() &&
+                      isClinicActive(clinicId) &&
+                      getUserDoc().get('clinicId', '') == clinicId &&
+                      resource.data.get('status', '') != 'completed' &&
+                      resource.data.get('status', '') != 'cancelled' &&
+                      isValidAppointmentTransition(resource.data.get('status', 'scheduled'), request.resource.data.get('status', 'scheduled')) &&
+                      (
+                        (
+                          getUserDoc().get('role', '') in ['receptionist', 'nurse'] &&
+                          validDoctorOnUpdate() &&
+                          (!('paymentStatus' in request.resource.data) || request.resource.data.paymentStatus == resource.data.get('paymentStatus', 'unpaid')) &&
+                          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                            'status', 'date', 'timeSlot', 'reason', 'notes', 'type', 'durationMin', 'tokenNumber', 'queueToken', 'cancelledAt', 'updatedAt'
+                          ])
+                        ) ||
+                        (
+                          getUserDoc().get('role', '') == 'doctor' &&
+                          resource.data.get('doctorId', '') == request.auth.uid &&
+                          validDoctorOnUpdate() &&
+                          (!('paymentStatus' in request.resource.data) || request.resource.data.paymentStatus == resource.data.get('paymentStatus', 'unpaid')) &&
+                          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'notes', 'updatedAt'])
+                        ) ||
+                        (
+                          (
+                            getUserDoc().get('role', '') == 'clinic_manager' ||
+                            (getUserDoc().get('role', '') == 'clinic_owner' && get(/databases/$(database)/documents/clinics/$(clinicId)).data.get('ownerUid', '') == request.auth.uid)
+                          ) &&
+                          (!('paymentStatus' in request.resource.data) || request.resource.data.paymentStatus == resource.data.get('paymentStatus', 'unpaid')) &&
+                          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                            'status', 'date', 'timeSlot', 'doctorId', 'doctorName', 'branchId',
+                            'reason', 'notes', 'type', 'durationMin', 'tokenNumber', 'queueToken', 'cancelledAt', 'updatedAt'
+                          ])
+                        ) ||
+                        (
+                          getUserDoc().get('role', '') == 'accountant' &&
+                          validDoctorOnUpdate() &&
+                          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                            'paymentStatus', 'notes', 'updatedAt'
+                          ])
+                        ) ||
+                        (
+                          isPatientOwner(clinicId, resource.data.get('patientId', '')) &&
+                          resource.data.get('status', '') in ['scheduled', 'confirmed'] &&
+                          validDoctorOnUpdate() &&
+                          (!('paymentStatus' in request.resource.data) || request.resource.data.paymentStatus == resource.data.get('paymentStatus', 'unpaid')) &&
+                          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'date', 'timeSlot', 'reason', 'cancelledAt', 'updatedAt']) &&
+                          request.resource.data.get('status', '') in ['cancelled', 'rescheduled']
+                        )
+                      );
+
+        allow delete: if false;
+      }
+
+      // Live Waiting Room Queue
+      match /queues/{queueId} {
+        allow read: if isAnyTenantStaff(clinicId) ||
+                    isPatientOwner(clinicId, resource.data.get('patientId', ''));
+
+        allow create: if isValidId(queueId) &&
+                      isReceptionistOrStaff(clinicId) &&
+                      validTenantOnCreate(clinicId) &&
+                      ('tokenNumber' in request.resource.data && request.resource.data.tokenNumber != null) &&
+                      ('status' in request.resource.data && request.resource.data.status in ['waiting', 'called']) &&
+                      (!('patientId' in request.resource.data) || request.resource.data.patientId == null || patientExistsInClinic(clinicId, request.resource.data.patientId));
+
+        allow update: if validTenantOnUpdate(clinicId) &&
+                      isActiveAccount() &&
+                      isClinicActive(clinicId) &&
+                      getUserDoc().get('clinicId', '') == clinicId &&
+                      (
+                        getUserDoc().get('role', '') in ['receptionist', 'nurse', 'clinic_manager', 'doctor'] ||
+                        (getUserDoc().get('role', '') == 'clinic_owner' && get(/databases/$(database)/documents/clinics/$(clinicId)).data.get('ownerUid', '') == request.auth.uid)
+                      ) &&
+                      ('tokenNumber' in request.resource.data && request.resource.data.tokenNumber == resource.data.tokenNumber) &&
+                      (!('patientId' in resource.data) || validPatientOnUpdate()) &&
+                      resource.data.get('status', '') != 'completed' &&
+                      resource.data.get('status', '') != 'no_show' &&
+                      request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                        'status', 'calledAt', 'startedAt', 'completedAt', 'room', 'estimatedWaitMin', 'updatedAt'
+                      ]) &&
+                      (
+                        (isValidQueueTransition(resource.data.get('status', 'waiting'), request.resource.data.get('status', 'waiting')) && resource.data.get('status', '') != 'skipped') ||
+                        (
+                          resource.data.get('status', '') == 'skipped' &&
+                          request.resource.data.get('status', '') == 'waiting' &&
+                          (
+                            getUserDoc().get('role', '') == 'clinic_manager' ||
+                            (getUserDoc().get('role', '') == 'clinic_owner' && get(/databases/$(database)/documents/clinics/$(clinicId)).data.get('ownerUid', '') == request.auth.uid)
+                          )
+                        )
+                      );
+
+        allow delete: if isClinicManagerOrOwner(clinicId);
+      }
+
+      // Clinical Consultations (Immutable once finalized)
+      match /consultations/{consultationId} {
+        allow read: if isDoctor(clinicId) ||
+                    isClinicOwner(clinicId) ||
+                    (isPatientOwner(clinicId, resource.data.get('patientId', '')) && resource.data.get('status', '') == 'finalized');
+
+        allow create: if isValidId(consultationId) &&
+                      isDoctor(clinicId) &&
+                      ('doctorId' in request.resource.data && request.resource.data.doctorId == request.auth.uid) &&
+                      validTenantOnCreate(clinicId) &&
+                      ('patientId' in request.resource.data && patientExistsInClinic(clinicId, request.resource.data.patientId)) &&
+                      request.resource.data.get('status', 'draft') in ['draft', 'finalized'];
+
+        allow update: if isDoctor(clinicId) &&
+                      resource.data.get('doctorId', '') == request.auth.uid &&
+                      validTenantOnUpdate(clinicId) &&
+                      validDoctorOnUpdate() &&
+                      validPatientOnUpdate() &&
+                      resource.data.get('status', '') != 'finalized' &&
+                      request.resource.data.get('status', '') in ['draft', 'finalized'];
+
+        allow delete: if false;
+      }
+
+      // Prescriptions (Immutable once finalized; only doctor authors/finalizes)
+      match /prescriptions/{prescriptionId} {
+        allow read: if isDoctor(clinicId) ||
+                    isStaffMemberWithRole(clinicId, ['nurse']) ||
+                    isClinicOwner(clinicId) ||
+                    (isPatientOwner(clinicId, resource.data.get('patientId', '')) && resource.data.get('status', '') == 'finalized');
+
+        allow create: if isValidId(prescriptionId) &&
+                      isDoctor(clinicId) &&
+                      ('doctorId' in request.resource.data && request.resource.data.doctorId == request.auth.uid) &&
+                      validTenantOnCreate(clinicId) &&
+                      ('patientId' in request.resource.data && patientExistsInClinic(clinicId, request.resource.data.patientId)) &&
+                      request.resource.data.get('status', 'draft') in ['draft', 'finalized'];
+
+        allow update: if isDoctor(clinicId) &&
+                      resource.data.get('doctorId', '') == request.auth.uid &&
+                      validTenantOnUpdate(clinicId) &&
+                      validDoctorOnUpdate() &&
+                      validPatientOnUpdate() &&
+                      resource.data.get('status', '') != 'finalized' &&
+                      request.resource.data.get('status', '') in ['draft', 'finalized'];
+
+        allow delete: if false;
+      }
+
+      // Laboratory Results
+      match /labResults/{resultId} {
+        allow read: if isClinicalStaff(clinicId) ||
+                    (isPatientOwner(clinicId, resource.data.get('patientId', '')) && resource.data.get('status', '') == 'approved');
+
+        allow create: if isValidId(resultId) &&
+                      isClinicalStaff(clinicId) &&
+                      validTenantOnCreate(clinicId) &&
+                      ('patientId' in request.resource.data && patientExistsInClinic(clinicId, request.resource.data.patientId)) &&
+                      request.resource.data.get('status', 'pending') in ['pending', 'ordered'];
+
+        allow update: if validTenantOnUpdate(clinicId) &&
+                      validPatientOnUpdate() &&
+                      (isDoctor(clinicId) || isClinicOwner(clinicId)) &&
+                      (!('doctorId' in resource.data) || resource.data.doctorId == request.auth.uid || isClinicOwner(clinicId)) &&
+                      resource.data.get('status', '') != 'approved' &&
+                      request.resource.data.get('status', '') in ['pending', 'ordered', 'reviewed', 'approved'];
+
+        allow delete: if false;
+      }
+
+      // Invoices & Immutable Payment Ledger Subcollection
+      match /invoices/{invoiceId} {
+        allow read: if isAccountantOrAdmin(clinicId) ||
+                    isStaffMemberWithRole(clinicId, ['receptionist']) ||
+                    isPatientOwner(clinicId, resource.data.get('patientId', ''));
+
+        allow create: if isValidId(invoiceId) &&
+                      (isAccountantOrAdmin(clinicId) || isStaffMemberWithRole(clinicId, ['receptionist'])) &&
+                      validTenantOnCreate(clinicId) &&
+                      ('patientId' in request.resource.data && patientExistsInClinic(clinicId, request.resource.data.patientId)) &&
+                      ('totalAmount' in request.resource.data && request.resource.data.totalAmount is number && request.resource.data.totalAmount > 0) &&
+                      request.resource.data.get('paidAmount', 0) == 0 &&
+                      (!('remainingAmount' in request.resource.data) || request.resource.data.remainingAmount == request.resource.data.totalAmount) &&
+                      request.resource.data.get('paymentStatus', 'unpaid') in ['unpaid', 'draft', 'issued'];
+
+        allow update: if isAccountantOrAdmin(clinicId) &&
+                      validTenantOnUpdate(clinicId) &&
+                      validPatientOnUpdate() &&
+                      resource.data.get('paymentStatus', '') != 'paid' &&
+                      ('totalAmount' in request.resource.data && request.resource.data.totalAmount == resource.data.totalAmount) &&
+                      (!('subtotal' in request.resource.data) || !('subtotal' in resource.data) || request.resource.data.subtotal == resource.data.subtotal) &&
+                      (!('tax' in request.resource.data) || !('tax' in resource.data) || request.resource.data.tax == resource.data.tax) &&
+                      (!('discount' in request.resource.data) || !('discount' in resource.data) || request.resource.data.discount == resource.data.discount) &&
+                      (!('items' in request.resource.data) || !('items' in resource.data) || request.resource.data.items == resource.data.items) &&
+                      request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                        'paymentStatus', 'paidAmount', 'remainingAmount', 'paymentMethod',
+                        'paymentReference', 'paymentDate', 'updatedAt', 'receiptNumber', 'notes', 'lastPaymentId'
+                      ]) &&
+                      request.resource.data.get('paidAmount', 0) is number &&
+                      request.resource.data.get('paidAmount', 0) >= resource.data.get('paidAmount', 0) &&
+                      request.resource.data.get('paidAmount', 0) <= resource.data.totalAmount &&
+                      (
+                        request.resource.data.get('paidAmount', 0) == resource.data.get('paidAmount', 0) ||
+                        (
+                          'lastPaymentId' in request.resource.data &&
+                          isValidId(request.resource.data.lastPaymentId) &&
+                          !exists(/databases/$(database)/documents/clinics/$(clinicId)/invoices/$(invoiceId)/payments/$(request.resource.data.lastPaymentId)) &&
+                          existsAfter(/databases/$(database)/documents/clinics/$(clinicId)/invoices/$(invoiceId)/payments/$(request.resource.data.lastPaymentId))
+                        )
+                      ) &&
+                      (
+                        !('remainingAmount' in request.resource.data) ||
+                        request.resource.data.remainingAmount == resource.data.totalAmount - request.resource.data.get('paidAmount', 0)
+                      ) &&
+                      (
+                        (request.resource.data.get('paidAmount', 0) == resource.data.totalAmount && request.resource.data.get('paymentStatus', '') == 'paid') ||
+                        (request.resource.data.get('paidAmount', 0) > 0 && request.resource.data.get('paidAmount', 0) < resource.data.totalAmount && request.resource.data.get('paymentStatus', '') == 'partial') ||
+                        (request.resource.data.get('paidAmount', 0) == 0 && request.resource.data.get('paymentStatus', '') == 'unpaid')
+                      );
+
+        allow delete: if false;
+
+        match /payments/{paymentId} {
+          allow read: if isAccountantOrAdmin(clinicId) ||
+                      isStaffMemberWithRole(clinicId, ['receptionist']) ||
+                      isPatientOwner(clinicId, get(/databases/$(database)/documents/clinics/$(clinicId)/invoices/$(invoiceId)).data.get('patientId', ''));
+
+          allow create: if isValidId(paymentId) &&
+                        isAccountantOrAdmin(clinicId) &&
+                        validTenantOnCreate(clinicId) &&
+                        !exists(/databases/$(database)/documents/clinics/$(clinicId)/invoices/$(invoiceId)/payments/$(paymentId)) &&
+                        request.resource.data.get('invoiceId', '') == invoiceId &&
+                        request.resource.data.get('amount', 0) is number &&
+                        request.resource.data.get('amount', 0) > 0 &&
+                        request.resource.data.get('paymentMethod', '') in ['cash', 'card', 'insurance'] &&
+                        exists(/databases/$(database)/documents/clinics/$(clinicId)/invoices/$(invoiceId)) &&
+                        get(/databases/$(database)/documents/clinics/$(clinicId)/invoices/$(invoiceId)).data.get('paymentStatus', '') != 'paid' &&
+                        request.resource.data.amount <= (
+                          get(/databases/$(database)/documents/clinics/$(clinicId)/invoices/$(invoiceId)).data.totalAmount -
+                          get(/databases/$(database)/documents/clinics/$(clinicId)/invoices/$(invoiceId)).data.get('paidAmount', 0)
+                        ) &&
+                        getAfter(/databases/$(database)/documents/clinics/$(clinicId)/invoices/$(invoiceId)).data.get('lastPaymentId', '') == paymentId &&
+                        getAfter(/databases/$(database)/documents/clinics/$(clinicId)/invoices/$(invoiceId)).data.get('paidAmount', 0) ==
+                          get(/databases/$(database)/documents/clinics/$(clinicId)/invoices/$(invoiceId)).data.get('paidAmount', 0) + request.resource.data.amount;
+
+          allow update, delete: if false;
+        }
+      }
+
+      // Immutable Audit Logs
+      match /auditLogs/{logId} {
+        allow read: if isClinicOwner(clinicId) || isSuperAdmin();
+
+        allow create: if isValidId(logId) &&
+                      isAnyTenantStaff(clinicId) &&
+                      validTenantOnCreate(clinicId) &&
+                      ('actorUid' in request.resource.data && request.resource.data.actorUid == request.auth.uid) &&
+                      ('action' in request.resource.data && request.resource.data.action != null);
+
+        allow update, delete: if false;
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // Authoritative User Profiles: /users/{userId}
+    // -------------------------------------------------------------------------
+
+    match /users/{userId} {
+      allow read: if isSuperAdmin() || (
+        isSignedIn() && (
+          request.auth.uid == userId ||
+          isAnyTenantStaff(resource.data.get('clinicId', '')) ||
+          (
+            isActiveAccount() &&
+            getUserDoc().get('role', '') == 'patient' &&
+            getUserDoc().get('clinicId', '') == resource.data.get('clinicId', '') &&
+            isClinicActive(resource.data.get('clinicId', '')) &&
+            resource.data.get('role', '') in ['doctor', 'clinic_owner']
+          )
+        )
+      );
+
+      allow create: if isSignedIn() &&
+                    isValidId(userId) &&
+                    isValidRole(request.resource.data.get('role', '')) &&
+                    request.resource.data.get('role', '') != 'super_admin' &&
+                    (
+                      isSuperAdmin() ||
+                      (
+                        request.auth.uid == userId &&
+                        request.resource.data.get('status', 'active') == 'active' &&
+                        request.resource.data.get('role', '') == 'patient' &&
+                        'clinicId' in request.resource.data &&
+                        isClinicActive(request.resource.data.clinicId) &&
+                        (!('patientId' in request.resource.data) || request.resource.data.patientId == userId)
+                      ) ||
+                      (
+                        request.auth.uid == userId &&
+                        request.resource.data.get('status', 'active') == 'active' &&
+                        request.resource.data.get('role', '') == 'clinic_owner' &&
+                        'clinicId' in request.resource.data &&
+                        !exists(/databases/$(database)/documents/clinics/$(request.resource.data.clinicId)) &&
+                        getAfter(/databases/$(database)/documents/clinics/$(request.resource.data.clinicId)).data.ownerUid == request.auth.uid
+                      )
+                    );
+
+      allow update: if isSuperAdmin() || (
+        isActiveAccount() &&
+        request.auth.uid == userId &&
+        ('clinicId' in request.resource.data && request.resource.data.clinicId == resource.data.clinicId) &&
+        (!('patientId' in resource.data) || ('patientId' in request.resource.data && request.resource.data.patientId == resource.data.patientId)) &&
+        (!('patientId' in request.resource.data) || request.resource.data.patientId == resource.data.get('patientId', userId)) &&
+        ('role' in request.resource.data && request.resource.data.role == resource.data.role) &&
+        (!('status' in resource.data) || request.resource.data.get('status', 'active') == resource.data.status) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'nameAr', 'phone', 'avatar', 'updatedAt'])
+      );
+
+      allow delete: if false;
+    }
+  }
+}

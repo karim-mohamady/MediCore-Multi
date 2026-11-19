@@ -1,0 +1,157 @@
+{
+  "entities": {
+    "Clinic": {
+      "title": "Clinic",
+      "description": "Tenant medical center and facility profile",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "nameAr": { "type": "string" },
+        "code": { "type": "string" },
+        "status": { "type": "string", "enum": ["active", "trial", "suspended"] },
+        "ownerUid": { "type": "string" }
+      },
+      "required": ["id", "name", "code", "status", "ownerUid"]
+    },
+    "User": {
+      "title": "User",
+      "description": "Authoritative user profile, canonical role, status, and clinic membership",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "clinicId": { "type": "string" },
+        "role": { "type": "string", "enum": ["super_admin", "clinic_owner", "clinic_manager", "doctor", "receptionist", "nurse", "accountant", "patient"] },
+        "status": { "type": "string", "enum": ["active", "suspended", "disabled"] },
+        "name": { "type": "string" },
+        "email": { "type": "string" }
+      },
+      "required": ["id", "clinicId", "role", "status", "name"]
+    },
+    "Patient": {
+      "title": "Patient",
+      "description": "Patient demographic record bounded to tenant clinic",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "clinicId": { "type": "string" },
+        "fileNumber": { "type": "string" },
+        "nationalId": { "type": "string" },
+        "name": { "type": "string" },
+        "phone": { "type": "string" }
+      },
+      "required": ["id", "clinicId", "fileNumber", "nationalId", "name", "phone"]
+    },
+    "AppointmentSlot": {
+      "title": "AppointmentSlot",
+      "description": "Deterministic concurrency slot reservation lock",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "clinicId": { "type": "string" },
+        "doctorId": { "type": "string" },
+        "patientId": { "type": "string" },
+        "date": { "type": "string" },
+        "timeSlot": { "type": "string" },
+        "status": { "type": "string", "enum": ["reserved", "cancelled"] }
+      },
+      "required": ["id", "clinicId", "doctorId", "patientId", "date", "timeSlot", "status"]
+    },
+    "Appointment": {
+      "title": "Appointment",
+      "description": "Clinic appointment and visit lifecycle",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "clinicId": { "type": "string" },
+        "doctorId": { "type": "string" },
+        "patientId": { "type": "string" },
+        "date": { "type": "string" },
+        "timeSlot": { "type": "string" },
+        "status": { "type": "string", "enum": ["scheduled", "confirmed", "arrived", "in_consultation", "completed", "cancelled", "rescheduled"] }
+      },
+      "required": ["id", "clinicId", "doctorId", "patientId", "date", "timeSlot", "status"]
+    },
+    "QueueTicket": {
+      "title": "QueueTicket",
+      "description": "Live waiting room ticket token and status",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "clinicId": { "type": "string" },
+        "appointmentId": { "type": "string" },
+        "patientId": { "type": "string" },
+        "doctorId": { "type": "string" },
+        "tokenNumber": { "type": "string" },
+        "status": { "type": "string", "enum": ["waiting", "called", "in_room", "in_consultation", "completed", "no_show", "cancelled", "skipped"] }
+      },
+      "required": ["id", "clinicId", "patientId", "doctorId", "tokenNumber", "status"]
+    },
+    "Invoice": {
+      "title": "Invoice",
+      "description": "Medical billing invoice with immutable payment ledger subcollection",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "clinicId": { "type": "string" },
+        "patientId": { "type": "string" },
+        "invoiceNumber": { "type": "string" },
+        "totalAmount": { "type": "number" },
+        "paidAmount": { "type": "number" },
+        "remainingAmount": { "type": "number" },
+        "lastPaymentId": { "type": "string" },
+        "paymentStatus": { "type": "string", "enum": ["unpaid", "partial", "paid", "draft", "issued"] }
+      },
+      "required": ["id", "clinicId", "patientId", "invoiceNumber", "totalAmount", "paidAmount", "paymentStatus"]
+    },
+    "Payment": {
+      "title": "Payment",
+      "description": "Immutable append-only payment receipt under an invoice",
+      "type": "object",
+      "properties": {
+        "paymentId": { "type": "string" },
+        "clinicId": { "type": "string" },
+        "invoiceId": { "type": "string" },
+        "receiptNumber": { "type": "string" },
+        "amount": { "type": "number" },
+        "paymentMethod": { "type": "string", "enum": ["cash", "card", "insurance"] },
+        "timestamp": { "type": "string" }
+      },
+      "required": ["paymentId", "clinicId", "invoiceId", "amount", "paymentMethod", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "Authoritative user profiles and role bindings"
+    },
+    "/clinics/{clinicId}": {
+      "schema": "Clinic",
+      "description": "Tenant clinic configuration and ownership"
+    },
+    "/clinics/{clinicId}/patients/{patientId}": {
+      "schema": "Patient",
+      "description": "Tenant-scoped patient demographic records"
+    },
+    "/clinics/{clinicId}/appointmentSlots/{slotId}": {
+      "schema": "AppointmentSlot",
+      "description": "Deterministic slot reservation locks"
+    },
+    "/clinics/{clinicId}/appointments/{appointmentId}": {
+      "schema": "Appointment",
+      "description": "Tenant-scoped doctor appointments"
+    },
+    "/clinics/{clinicId}/queues/{queueId}": {
+      "schema": "QueueTicket",
+      "description": "Real-time waiting room queue tickets"
+    },
+    "/clinics/{clinicId}/invoices/{invoiceId}": {
+      "schema": "Invoice",
+      "description": "Patient billing invoices"
+    },
+    "/clinics/{clinicId}/invoices/{invoiceId}/payments/{paymentId}": {
+      "schema": "Payment",
+      "description": "Immutable append-only payment receipts"
+    }
+  }
+}

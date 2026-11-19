@@ -1,0 +1,46 @@
+{
+  "name": "react-example",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port=3000 --host=0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview",
+    "clean": "rm -rf dist server.js",
+    "lint": "tsc --noEmit",
+    "test": "tsx --test src/tests/security.test.ts src/tests/concurrency.test.ts src/tests/emulator-rules.test.ts src/tests/firebase-env.test.ts",
+    "test:emulator": "tsx --test src/tests/firestore.rules.test.ts",
+    "test:e2e": "tsx --test src/tests/emulator-e2e.test.ts",
+    "test:browser": "playwright test",
+    "test:all": "tsx --test src/tests/security.test.ts src/tests/concurrency.test.ts src/tests/emulator-rules.test.ts src/tests/firebase-env.test.ts src/tests/firestore.rules.test.ts src/tests/emulator-e2e.test.ts",
+    "staging:check": "node scripts/verify-staging-ready.mjs",
+    "staging:deploy": "node scripts/verify-staging-ready.mjs --deploy-check"
+  },
+  "dependencies": {
+    "@google/genai": "^2.4.0",
+    "@tailwindcss/vite": "^4.3.3",
+    "@vitejs/plugin-react": "^6.1.1",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
+    "firebase": "^13.3.0",
+    "lucide-react": "^0.546.0",
+    "motion": "^12.23.24",
+    "react": "^19.0.1",
+    "react-dom": "^19.0.1",
+    "vite": "^8.3.0"
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^6.0.0",
+    "@playwright/test": "^1.65.1",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.14.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "autoprefixer": "^10.4.21",
+    "esbuild": "^0.25.0",
+    "tailwindcss": "^4.3.3",
+    "tsx": "^4.21.0",
+    "typescript": "^7.0.2"
+  }
+}
